@@ -3,7 +3,7 @@ import time
 import requests
 
 # ================== CONFIG ==================
-DISCORD_WEBHOOK = "PUT_YOUR_DISCORD_WEBHOOK_HERE"
+DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1470940001150832776/qkCw4pWux_JqKFRCK3MqtwtgHgKUyvAJt-dt-UAfJwsoBK0tdymDlV541hBHjyOEG4XE"
 CAPITAL_USD = 100
 MIN_PROFIT_USD = 1.0   # alert only if profit >= $1
 SCAN_DELAY = 20        # seconds
