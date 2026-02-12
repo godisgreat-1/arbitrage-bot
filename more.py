@@ -1,102 +1,153 @@
-import ccxt
-import time
 import requests
+import time
+import hashlib
 
-# ================== CONFIG ==================
+# ==========================
+# CONFIG
+# ==========================
+
 DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1470940001150832776/qkCw4pWux_JqKFRCK3MqtwtgHgKUyvAJt-dt-UAfJwsoBK0tdymDlV541hBHjyOEG4XE"
-CAPITAL_USD = 100
-MIN_PROFIT_USD = 1.0   # alert only if profit >= $1
-SCAN_DELAY = 20        # seconds
 
-TRADING_FEE = 0.001    # 0.1% typical spot fee
+CAPITAL = 100
+TRADING_FEE = 0.001
+WITHDRAWAL_FEE_PERCENT = 0.002
+MAX_PROFIT_ALERT = 15
+CHECK_INTERVAL = 20
 
-# rough withdrawal fee estimates (USDT-based)
-WITHDRAW_FEES = {
-    "binance": 1.0,
-    "bybit": 1.0,
-    "gateio": 1.5,
-    "mexc": 1.0
-}
+sent_opportunities = set()
 
-# ================== EXCHANGES ==================
-exchanges = {
-    "binance": ccxt.binance(),
-    "bybit": ccxt.bybit(),
-    "gateio": ccxt.gateio(),
-    "mexc": ccxt.mexc()
-}
+# ==========================
+# DISCORD ALERT
+# ==========================
 
-for ex in exchanges.values():
-    ex.load_markets()
-
-# ================== HELPERS ==================
-def send_discord(msg):
-    requests.post(DISCORD_WEBHOOK, json={"content": msg})
-
-def get_best_prices(exchange, symbol):
+def send_discord(message):
     try:
-        ob = exchange.fetch_order_book(symbol, limit=5)
-        ask = ob["asks"][0][0] if ob["asks"] else None
-        bid = ob["bids"][0][0] if ob["bids"] else None
-        return ask, bid
+        requests.post(DISCORD_WEBHOOK, json={"content": message})
     except:
-        return None, None
+        pass
 
-def simulate_profit(buy_price, sell_price, buy_ex, sell_ex):
-    amount = CAPITAL_USD / buy_price
-    buy_cost = CAPITAL_USD * (1 + TRADING_FEE)
-    sell_value = amount * sell_price * (1 - TRADING_FEE)
-    withdraw_fee = WITHDRAW_FEES[buy_ex]
-    return sell_value - buy_cost - withdraw_fee
+# ==========================
+# GET SYMBOLS
+# ==========================
 
-# ================== MAIN LOOP ==================
-print("🚀 Arbitrage Scanner Started (NO API KEYS)")
-send_discord("🚀 Arbitrage Scanner Started\nCapital: $100")
+def get_mexc_symbols():
+    url = "https://api.mexc.com/api/v3/exchangeInfo"
+    data = requests.get(url).json()
+    return set(
+        s["symbol"] for s in data["symbols"]
+        if s["quoteAsset"] == "USDT" and s["status"] == "1"
+    )
 
-while True:
-    try:
-        symbols = set(
-            s for s in exchanges["binance"].symbols
-            if s.endswith("/USDT")
-        )
+def get_gate_symbols():
+    url = "https://api.gateio.ws/api/v4/spot/currency_pairs"
+    data = requests.get(url).json()
+    return set(
+        s["id"].replace("_", "") for s in data
+        if s["quote"] == "USDT"
+    )
 
-        for symbol in symbols:
-            prices = {}
+# ==========================
+# ORDER BOOK
+# ==========================
 
-            for name, ex in exchanges.items():
-                ask, bid = get_best_prices(ex, symbol)
-                if ask and bid:
-                    prices[name] = {"ask": ask, "bid": bid}
+def get_mexc_orderbook(symbol):
+    url = f"https://api.mexc.com/api/v3/depth?symbol={symbol}&limit=5"
+    data = requests.get(url).json()
+    best_ask = float(data["asks"][0][0])
+    best_bid = float(data["bids"][0][0])
+    return best_ask, best_bid
 
-            for buy_ex in prices:
-                for sell_ex in prices:
-                    if buy_ex == sell_ex:
-                        continue
+def get_gate_orderbook(symbol):
+    pair = symbol[:-4] + "_USDT"
+    url = f"https://api.gateio.ws/api/v4/spot/order_book?currency_pair={pair}&limit=5"
+    data = requests.get(url).json()
+    best_ask = float(data["asks"][0][0])
+    best_bid = float(data["bids"][0][0])
+    return best_ask, best_bid
 
-                    buy_price = prices[buy_ex]["ask"]
-                    sell_price = prices[sell_ex]["bid"]
+# ==========================
+# PROFIT CALCULATOR
+# ==========================
 
-                    if sell_price <= buy_price:
-                        continue
+def calculate_profit(buy_price, sell_price):
+    amount = CAPITAL / buy_price
+    amount_after_buy_fee = amount * (1 - TRADING_FEE)
+    amount_after_withdraw = amount_after_buy_fee * (1 - WITHDRAWAL_FEE_PERCENT)
+    final_usdt = amount_after_withdraw * sell_price
+    final_usdt_after_sell_fee = final_usdt * (1 - TRADING_FEE)
+    profit = final_usdt_after_sell_fee - CAPITAL
+    return round(profit, 2)
 
-                    profit = simulate_profit(
-                        buy_price, sell_price, buy_ex, sell_ex
-                    )
+def calculate_spread(buy_price, sell_price):
+    spread = ((sell_price - buy_price) / buy_price) * 100
+    return round(spread, 2)
 
-                    if profit >= MIN_PROFIT_USD:
-                        msg = (
-                            f"🔥 ARBITRAGE FOUND\n"
+# ==========================
+# MAIN LOOP
+# ==========================
+
+def run():
+    print("🚀 Arbitrage Scanner Started")
+
+    mexc_symbols = get_mexc_symbols()
+    gate_symbols = get_gate_symbols()
+
+    common_pairs = list(mexc_symbols.intersection(gate_symbols))
+    print(f"🔎 Found {len(common_pairs)} common pairs")
+
+    while True:
+        for symbol in common_pairs:
+            try:
+                mexc_ask, mexc_bid = get_mexc_orderbook(symbol)
+                gate_ask, gate_bid = get_gate_orderbook(symbol)
+
+                # Scenario 1
+                profit1 = calculate_profit(mexc_ask, gate_bid)
+
+                # Scenario 2
+                profit2 = calculate_profit(gate_ask, mexc_bid)
+
+                if profit1 > profit2:
+                    best_profit = profit1
+                    buy_exchange = "MEXC"
+                    sell_exchange = "Gate.io"
+                    buy_price = mexc_ask
+                    sell_price = gate_bid
+                else:
+                    best_profit = profit2
+                    buy_exchange = "Gate.io"
+                    sell_exchange = "MEXC"
+                    buy_price = gate_ask
+                    sell_price = mexc_bid
+
+                spread_percent = calculate_spread(buy_price, sell_price)
+
+                if 0 < best_profit <= MAX_PROFIT_ALERT:
+                    unique_id = hashlib.md5(
+                        f"{symbol}{buy_exchange}{sell_exchange}{best_profit}".encode()
+                    ).hexdigest()
+
+                    if unique_id not in sent_opportunities:
+                        sent_opportunities.add(unique_id)
+
+                        message = (
+                            f"🔥 ARBITRAGE FOUND\n\n"
                             f"Coin: {symbol}\n"
-                            f"Buy: {buy_ex} @ {buy_price}\n"
-                            f"Sell: {sell_ex} @ {sell_price}\n"
-                            f"Capital: $100\n"
-                            f"Estimated Profit: ${profit:.2f}"
+                            f"Buy: {buy_exchange} @ {buy_price}\n"
+                            f"Sell: {sell_exchange} @ {sell_price}\n"
+                            f"Spread: {spread_percent}%\n"
+                            f"Capital: ${CAPITAL}\n"
+                            f"Estimated Profit: ${best_profit}"
                         )
-                        print(msg)
-                        send_discord(msg)
 
-        time.sleep(SCAN_DELAY)
+                        print(message)
+                        send_discord(message)
 
-    except Exception as e:
-        print("Error:", e)
-        time.sleep(10)
+            except:
+                continue
+
+        time.sleep(CHECK_INTERVAL)
+
+
+if __name__ == "__main__":
+    run()
